@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# Data
+data/
+datasets_raw/
+*.npy
+*.npz
+*.nii
+*.nii.gz
+*.dcm
+*.mat
+
+# Training outputs
+experiments/
+checkpoints/
+logs/
+runs/
+outputs/
+*.pth
+*.pt
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
