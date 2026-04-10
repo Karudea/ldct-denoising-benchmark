@@ -38,7 +38,7 @@ class LDCTPatchNPYDataset(Dataset):
         3mm -> 1.0
 
       因此：
-      - 2D + cond_thickness      => 2 通道
+      - 2D + cond_thickness           => 2 通道
       - 2.5D(3slice) + cond_thickness => 4 通道
       - 2.5D(5slice) + cond_thickness => 6 通道
     """

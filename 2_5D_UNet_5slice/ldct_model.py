@@ -54,8 +54,16 @@ class UNet(nn.Module):
     当前版本：
     - 支持 2D / 2.5D 输入
     - 支持 cond thickness 拼接后的多通道输入
-    - 使用 residual learning
-    - 不使用 sigmoid（linear output）
+    - residual learning
+    - 默认 no sigmoid（linear output）
+
+    identity 选择规则：
+    - 1 通道: 取第 0 通道
+    - 2 通道: 2D + cond_thickness，取第 0 通道
+    - 3 通道: 3slice，取第 1 通道
+    - 4 通道: 3slice + cond_thickness，取第 1 通道
+    - 5 通道: 5slice，取第 2 通道
+    - 6 通道: 5slice + cond_thickness，取第 2 通道
     """
 
     def __init__(self, in_channels=1, out_channels=1, base_ch=64, use_sigmoid=False):
@@ -89,22 +97,33 @@ class UNet(nn.Module):
         # Output residual branch
         self.out_conv = nn.Conv2d(base_ch, out_channels, kernel_size=1)
 
+    @staticmethod
+    def _select_identity(x: torch.Tensor) -> torch.Tensor:
+        c = x.shape[1]
+
+        if c == 1:
+            # 2D
+            return x[:, 0:1, :, :]
+        elif c == 2:
+            # 2D + cond thickness
+            return x[:, 0:1, :, :]
+        elif c == 3:
+            # 2.5D 3slice
+            return x[:, 1:2, :, :]
+        elif c == 4:
+            # 2.5D 3slice + cond thickness
+            return x[:, 1:2, :, :]
+        elif c == 5:
+            # 2.5D 5slice
+            return x[:, 2:3, :, :]
+        elif c == 6:
+            # 2.5D 5slice + cond thickness
+            return x[:, 2:3, :, :]
+        else:
+            raise ValueError(f"[ERROR] 不支持的输入通道数: {c}")
+
     def forward(self, x):
-        """
-        x: (N, C, H, W)
-
-        residual learning:
-            out = identity + residual
-
-        这里 identity 取输入的第 1 个通道作为中心重建基底：
-        - 2D 输入时，第 0 通道就是原图
-        - 2.5D 输入时，默认第 0 通道作为 identity
-          （前提：你的数据构造就是把中心 slice 放在第 0 通道）
-
-        如果你后续的 2.5D 数据是中心帧不在第 0 通道，
-        再告诉我，我给你改成 center_index 可配置版。
-        """
-        identity = x[:, 0:1, :, :]
+        identity = self._select_identity(x)
 
         # Encoder
         x1 = self.enc1(x)

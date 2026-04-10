@@ -39,7 +39,7 @@ def get_runtime_paths() -> Dict[str, Path]:
 
     return {
         "data_root": data_root,
-        "prepared_root": data_root / "prepared_1mm3mm_hu_-160_240",
+        "prepared_root": data_root / "prepared_2p5d_5slice_1mm3mm_hu_-160_240",
         "split_dir": data_root / "splits",
         "exp_root": exp_root,
     }
@@ -51,7 +51,7 @@ SPLIT_DIR = PATHS["split_dir"]
 EXP_ROOT = PATHS["exp_root"]
 
 # ================== 实验配置 ==================
-EXP_NAME = "C4_mixed_cond_th_residual_nosig_l1_trainall_valall"
+EXP_NAME = "C4_mixed_cond_th_2p5d_5slice_residual_nosig_l1_trainall_valall"
 SAVE_DIR = EXP_ROOT / EXP_NAME
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -314,6 +314,7 @@ def main():
                     "model_in_channels": model_in_channels,
                     "model_out_channels": 1,
                     "base_ch": 64,
+                    "input_mode": "2.5D_5slice_cond_th",
                     "loss": LOSS_NAME,
                     "output_activation": output_activation,
                     "use_sigmoid": USE_SIGMOID,
@@ -438,6 +439,7 @@ def main():
                         "use_sigmoid": USE_SIGMOID,
                         "residual_learning": RESIDUAL_LEARNING,
                         "loss": LOSS_NAME,
+                        "input_mode": "2.5D_5slice_cond_th",
                     },
                     ckpt_path,
                 )
