@@ -1,168 +1,332 @@
 import os
 import json
-import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import pydicom
 from tqdm import tqdm
 
 from ldct_model import UNet
-from ldct_npy_dataset import LDCTPatchNPYDataset
 
 
-# ================== 统一路径配置 ==================
-def get_runtime_paths() -> Dict[str, Path]:
-    """
-    通过环境变量 IS_CLOUD 控制本地 / 云端路径
+# =========================
+# 0. 配置区（你只改这里）
+# =========================
 
-    本地 Windows:
-        不设置 IS_CLOUD，默认使用 E:\\LDCT
-
-    云端 Linux:
-        export IS_CLOUD=1
-        默认路径:
-            /workspace/data
-            /workspace/experiments
-            /workspace/eval_results
-    """
-    is_cloud = os.getenv("IS_CLOUD", "0") == "1"
-
-    if is_cloud:
-        data_root = Path("/workspace/data")
-        exp_root = Path("/workspace/experiments")
-        eval_root = Path("/workspace/eval_results")
-    else:
-        data_root = Path(r"E:\LDCT")
-        exp_root = data_root / "experiments"
-        eval_root = data_root / "eval_results"
-
-    return {
-        "data_root": data_root,
-        "prepared_root": data_root / "prepared_1mm3mm_hu_-160_240",
-        "split_dir": data_root / "splits",
-        "exp_root": exp_root,
-        "eval_root": eval_root,
-    }
-
-
-PATHS = get_runtime_paths()
-PREPARED_ROOT = PATHS["prepared_root"]
-SPLIT_DIR = PATHS["split_dir"]
-EXP_ROOT = PATHS["exp_root"]
-EVAL_ROOT = PATHS["eval_root"]
-
-
-# ================== 配置区（你只改这里） ==================
-EXP_NAME = "DS_C4_mixed_cond_th_trainall_valall"
+# ---- 实验命名（和 train 保持一致）----
+EXP_NAME = "DS_C4_mixed_cond_th_no_sigmoid_residual_trainall_valall"
 SEED = 0
 
-# 评估哪个 split
-EVAL_SPLIT = "test"   # "train" | "val" | "test"
+# ---- 数据路径 ----
+TRAIN_DATA_ROOT = r"E:\LDCT\Training_Image_Data\1mm B30"
+TEST_QD_ROOT = r"E:\LDCT\Testing_Image_Data\1mm B30\QD_1mm"
+SPLIT_JSON = r"E:\LDCT\splits\patient_splits.json"
 
-# 分别统计 1mm 和 3mm
-EVAL_THICKNESSES = ["1mm", "3mm"]
+# ---- 模型路径 ----
+CKPT_PATH = rf"E:\LDCT\experiments\{EXP_NAME}\seed_{SEED}\best_{EXP_NAME}_seed{SEED}.pth"
 
-# 与训练保持一致（仅用于记录）
+# ---- 输出目录 ----
+SAVE_ROOT = rf"E:\LDCT\eval_results\{EXP_NAME}_seed{SEED}"
+
+# ---- 评估设置 ----
+EVAL_SPLIT = "test"          # "train" | "val" | "test" | "external_test"
+EVAL_THICKNESS = "3mm"       # "1mm" | "3mm"
+PATCH_SIZE = 256
+
+# ---- 与训练对应的 thickness 信息（仅用于记录）----
 TRAIN_THICKNESS = "all"
 VAL_THICKNESS = "all"
 COND_THICKNESS = True
-MODEL_IN_CHANNELS = 2 if COND_THICKNESS else 1
 
-DEEP_SUPERVISION = True
-SIGMOID_OUTPUT = "follow_model_impl"
-DS_WEIGHTS = {
-    "main": 1.0,
-    "aux_d2": 0.5,
-    "aux_d3": 0.25,
+# ---- thickness 映射 ----
+THICKNESS_TO_ID = {
+    "1mm": 0,
+    "3mm": 1,
 }
 
-# DataLoader
-BATCH_SIZE = 8
-NUM_WORKERS = 0
-
-# 归一化窗口（与训练保持一致）
+# ---- 归一化窗口（必须和训练保持一致）----
 CLIP_MIN = -160.0
 CLIP_MAX = 240.0
 
-# 指标空间
-# "norm": 在 [0,1] 空间算 MAE/RMSE/NRMSE/HFEN
-# "hu"  : 先反归一化到 HU 再算 MAE/RMSE/NRMSE/HFEN
-# PSNR / SSIM 仍在 [0,1] 空间计算
-METRIC_SPACE_FOR_MAE_RMSE_NRMSE_HFEN = "hu"
+# ---- 指标空间 ----
+# "norm"：在 [0,1] 归一化空间算
+# "hu"  ：先反归一化回 HU 再算 RMSE/MAE/NRMSE/HFEN；PSNR/SSIM 默认仍在 norm 空间
+METRIC_SPACE = "hu"
 
-# 预测后处理
+# ---- 预测后处理 ----
+# no sigmoid + residual：输出可能超出 [0,1]
 CLIP_PRED_BEFORE_METRIC = True
+SAVE_RAW_PRED = True   # external_test 时额外保存 raw prediction
 
-# HFEN
-HFEN_KERNEL_SIZE = 15
-HFEN_SIGMA = 1.5
+# ---- 可视化 ----
+SAVE_VIS = True
+VIS_PER_PATIENT_MAX = 3
+DIFF_VMAX_HU = 80.0
+ROI_SIZE = 128
+AUTO_ROI_BY_ERROR = True
 
-# 设备
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---- 设备 ----
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# checkpoint 路径
-CKPT_PATH = EXP_ROOT / EXP_NAME / f"seed_{SEED}" / f"best_{EXP_NAME}_seed{SEED}.pth"
+FD_ROOTS = {
+    "1mm": os.path.join(TRAIN_DATA_ROOT, "full_1mm"),
+    "3mm": os.path.join(TRAIN_DATA_ROOT, "full_3mm"),
+}
+QD_ROOTS = {
+    "1mm": os.path.join(TRAIN_DATA_ROOT, "quarter_1mm"),
+    "3mm": os.path.join(TRAIN_DATA_ROOT, "quarter_3mm"),
+}
 
-# 输出目录：注意这里不再包含单个 thickness
-SAVE_ROOT = EVAL_ROOT / f"{EXP_NAME}_seed{SEED}" / EVAL_SPLIT
+Z_TOL_MM = 1e-2
 
 
-# ================== 基础工具函数 ==================
+# =========================
+# 1. 基础工具函数
+# =========================
+
 def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
-def set_seed(seed: int):
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def load_splits(split_json_path: str):
+    with open(split_json_path, "r", encoding="utf-8") as f:
+        splits = json.load(f)
+    for k in ["train", "val", "test", "external_test"]:
+        splits.setdefault(k, [])
+    return splits
 
 
-def norm_to_hu(img: np.ndarray, clip_min=CLIP_MIN, clip_max=CLIP_MAX) -> np.ndarray:
+def safe_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def get_z_position(ds) -> Optional[float]:
+    ipp = getattr(ds, "ImagePositionPatient", None)
+    if ipp is not None and len(ipp) >= 3:
+        z = safe_float(ipp[2])
+        if z is not None:
+            return z
+    sl = getattr(ds, "SliceLocation", None)
+    return safe_float(sl)
+
+
+def get_instance_number(ds) -> int:
+    try:
+        return int(getattr(ds, "InstanceNumber", 0))
+    except Exception:
+        return 0
+
+
+def list_dicom_files(folder: Path):
+    if not folder.exists():
+        return []
+    return [
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in [".dcm", ".ima", ""]
+    ]
+
+
+def load_dicom_series(folder: Path) -> List:
+    files = list_dicom_files(folder)
+    if not files:
+        print(f"⚠️ 空目录: {folder}")
+        return []
+
+    series = []
+    for f in files:
+        try:
+            ds = pydicom.dcmread(str(f), force=True)
+            series.append(ds)
+        except Exception as e:
+            print(f"⚠️ 读取失败: {f}, err={e}")
+
+    if not series:
+        return []
+
+    zs = [get_z_position(d) for d in series]
+    if all(z is not None for z in zs):
+        series.sort(key=lambda d: get_z_position(d))
+    else:
+        series.sort(key=get_instance_number)
+
+    return series
+
+
+def dicom_to_hu(ds):
+    img = ds.pixel_array.astype(np.float32)
+    slope = float(getattr(ds, "RescaleSlope", 1.0))
+    intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+    return img * slope + intercept
+
+
+def hu_to_norm(img, clip_min=CLIP_MIN, clip_max=CLIP_MAX):
+    img = np.clip(img, clip_min, clip_max)
+    return ((img - clip_min) / (clip_max - clip_min)).astype(np.float32)
+
+
+def norm_to_hu(img, clip_min=CLIP_MIN, clip_max=CLIP_MAX):
     return (img * (clip_max - clip_min) + clip_min).astype(np.float32)
 
 
-def create_log_kernel(kernel_size=15, sigma=1.5, device="cpu"):
-    ax = torch.arange(kernel_size, dtype=torch.float32, device=device) - kernel_size // 2
-    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
-    norm2 = xx ** 2 + yy ** 2
-    sigma2 = sigma ** 2
-
-    gauss = torch.exp(-norm2 / (2 * sigma2))
-    gauss = gauss / gauss.sum()
-
-    log_kernel = ((norm2 - 2 * sigma2) / (sigma2 ** 2)) * gauss
-    log_kernel = log_kernel - log_kernel.mean()
-    return log_kernel.unsqueeze(0).unsqueeze(0)
+def center_crop_to_multiple(img: np.ndarray, multiple: int):
+    h, w = img.shape
+    nh = (h // multiple) * multiple
+    nw = (w // multiple) * multiple
+    sh = (h - nh) // 2
+    sw = (w - nw) // 2
+    cropped = img[sh:sh + nh, sw:sw + nw]
+    return cropped, (sh, sw, nh, nw)
 
 
-def compute_hfen(pred: np.ndarray, gt: np.ndarray, kernel_size=15, sigma=1.5) -> float:
-    kernel = create_log_kernel(kernel_size=kernel_size, sigma=sigma, device="cpu")
-
-    pred_t = torch.from_numpy(pred.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-    gt_t = torch.from_numpy(gt.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-
-    pred_f = F.conv2d(pred_t, kernel, padding=kernel_size // 2)
-    gt_f = F.conv2d(gt_t, kernel, padding=kernel_size // 2)
-
-    num = torch.norm(pred_f - gt_f, p=2).item()
-    den = torch.norm(gt_f, p=2).item() + 1e-12
-    return float(num / den)
+def quantize_z(z: float, tol: float) -> float:
+    return round(z / tol) * tol
 
 
-# ================== SSIM ==================
+def match_fd_qd_pairs(fd_series: List, qd_series: List) -> List[Tuple]:
+    if not fd_series or not qd_series:
+        return []
+
+    fd_z = [get_z_position(d) for d in fd_series]
+    qd_z = [get_z_position(d) for d in qd_series]
+
+    if all(z is not None for z in fd_z) and all(z is not None for z in qd_z):
+        fd_map: Dict[float, object] = {}
+        for d in fd_series:
+            z = quantize_z(get_z_position(d), Z_TOL_MM)
+            fd_map.setdefault(z, d)
+
+        pairs = []
+        miss = 0
+        for q in qd_series:
+            z = quantize_z(get_z_position(q), Z_TOL_MM)
+            f = fd_map.get(z, None)
+            if f is None:
+                miss += 1
+                continue
+            pairs.append((f, q))
+
+        if pairs:
+            if miss > 0:
+                print(f"⚠️ z 匹配有缺失：QD 有 {miss} 张在 FD 中找不到对应 z（已跳过）")
+            return pairs
+
+        print("⚠️ z 匹配失败：退化为 InstanceNumber 对齐")
+
+    print("⚠️ DICOM 缺少完整 z 信息，退化为 InstanceNumber 对齐（可能存在错配风险）")
+    fd_sorted = sorted(fd_series, key=get_instance_number)
+    qd_sorted = sorted(qd_series, key=get_instance_number)
+    min_n = min(len(fd_sorted), len(qd_sorted))
+    return [(fd_sorted[i], qd_sorted[i]) for i in range(min_n)]
+
+
+# =========================
+# 2. Thickness 条件输入
+# =========================
+
+def build_model_input_batch(
+    qd_batch_np: np.ndarray,
+    thickness_id: int,
+    device: str
+) -> torch.Tensor:
+    n, h, w = qd_batch_np.shape
+    qd_t = torch.from_numpy(qd_batch_np).unsqueeze(1).to(device)  # (N,1,H,W)
+
+    if not COND_THICKNESS:
+        return qd_t
+
+    th_map_np = np.full((n, h, w), float(thickness_id), dtype=np.float32)
+    th_t = torch.from_numpy(th_map_np).unsqueeze(1).to(device)    # (N,1,H,W)
+
+    x = torch.cat([qd_t, th_t], dim=1)  # (N,2,H,W)
+    return x
+
+
+# =========================
+# 3. Patch 切分 / 回拼
+# =========================
+
+def image_to_patches(img: np.ndarray, patch_size: int):
+    h, w = img.shape
+    patches = []
+    coords = []
+    for y in range(0, h, patch_size):
+        for x in range(0, w, patch_size):
+            p = img[y:y + patch_size, x:x + patch_size]
+            if p.shape == (patch_size, patch_size):
+                patches.append(p)
+                coords.append((y, x))
+    patches = np.stack(patches, axis=0).astype(np.float32)
+    return patches, coords, (h, w)
+
+
+def stitch_patches(patches: np.ndarray, coords: List[Tuple[int, int]], out_hw: Tuple[int, int], patch_size: int):
+    h, w = out_hw
+    out = np.zeros((h, w), dtype=np.float32)
+    count = np.zeros((h, w), dtype=np.float32)
+
+    for p, (y, x) in zip(patches, coords):
+        out[y:y + patch_size, x:x + patch_size] += p
+        count[y:y + patch_size, x:x + patch_size] += 1.0
+
+    count[count == 0] = 1.0
+    out = out / count
+    return out
+
+
+@torch.no_grad()
+def predict_full_slice_raw(
+    model: nn.Module,
+    qd_norm: np.ndarray,
+    patch_size: int,
+    device: str,
+    thickness_id: int,
+    batch_size: int = 8
+):
+    """
+    DS 模型可能返回 dict，这里只取 main 分支用于评估
+    """
+    patches, coords, out_hw = image_to_patches(qd_norm, patch_size)
+    preds = []
+
+    for i in range(0, len(patches), batch_size):
+        batch = patches[i:i + batch_size]
+        batch_t = build_model_input_batch(batch, thickness_id, device)
+        out = model(batch_t)
+
+        if isinstance(out, dict):
+            if "main" not in out:
+                raise KeyError("[ERROR] DS eval 时模型输出为 dict，但缺少 'main' 键。")
+            out = out["main"]
+
+        out = out.squeeze(1).cpu().numpy().astype(np.float32)
+        preds.append(out)
+
+    preds = np.concatenate(preds, axis=0)
+    pred_full_raw = stitch_patches(preds, coords, out_hw, patch_size)
+    return pred_full_raw
+
+
+def postprocess_prediction_for_metric(pred_norm_raw: np.ndarray) -> np.ndarray:
+    if CLIP_PRED_BEFORE_METRIC:
+        return np.clip(pred_norm_raw, 0.0, 1.0).astype(np.float32)
+    return pred_norm_raw.astype(np.float32)
+
+
+# =========================
+# 4. 指标
+# =========================
+
 class SSIMMetric(nn.Module):
-    """
-    返回 SSIM 值（不是 loss）
-    输入: [N,1,H,W]，范围默认 [0,1]
-    """
     def __init__(self, window_size=11):
         super().__init__()
         self.window_size = window_size
@@ -209,37 +373,18 @@ class SSIMMetric(nn.Module):
         return ssim_val
 
 
-# ================== 指标 ==================
-def compute_psnr_from_torch(pred: torch.Tensor, target: torch.Tensor) -> List[float]:
-    """
-    pred/target: [N,1,H,W] or [N,H,W]
-    返回 batch 内每个样本的 PSNR
-    """
-    if pred.ndim == 4:
-        pred = pred.squeeze(1)
-    if target.ndim == 4:
-        target = target.squeeze(1)
-
-    pred = pred.float()
-    target = target.float()
-
-    batch_vals = []
-    for i in range(pred.shape[0]):
-        mse = torch.mean((pred[i] - target[i]) ** 2).item()
-        if mse <= 1e-12:
-            batch_vals.append(99.0)
-        else:
-            batch_vals.append(float(10.0 * np.log10(1.0 / mse)))
-    return batch_vals
+def compute_psnr_norm(pred_norm: np.ndarray, gt_norm: np.ndarray) -> float:
+    mse = np.mean((pred_norm - gt_norm) ** 2, dtype=np.float64)
+    if mse <= 1e-12:
+        return 99.0
+    return float(10.0 * np.log10(1.0 / mse))
 
 
-@torch.no_grad()
-def compute_ssim_batch(pred: torch.Tensor, target: torch.Tensor, ssim_metric: SSIMMetric) -> List[float]:
-    vals = []
-    for i in range(pred.shape[0]):
-        val = ssim_metric(pred[i:i + 1], target[i:i + 1]).item()
-        vals.append(float(val))
-    return vals
+def compute_ssim_norm(pred_norm: np.ndarray, gt_norm: np.ndarray, ssim_metric: SSIMMetric, device: str) -> float:
+    a = torch.from_numpy(pred_norm).unsqueeze(0).unsqueeze(0).to(device)
+    b = torch.from_numpy(gt_norm).unsqueeze(0).unsqueeze(0).to(device)
+    val = ssim_metric(a, b).item()
+    return float(val)
 
 
 def compute_mae(pred: np.ndarray, gt: np.ndarray) -> float:
@@ -263,7 +408,247 @@ def compute_nrmse(pred: np.ndarray, gt: np.ndarray, mode: str = "range") -> floa
     return float(rmse / denom)
 
 
-def summarize_metrics(records: List[dict], keys: List[str]):
+def create_log_kernel(kernel_size=15, sigma=1.5, device="cpu"):
+    ax = torch.arange(kernel_size, dtype=torch.float32, device=device) - kernel_size // 2
+    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+    norm2 = xx ** 2 + yy ** 2
+    sigma2 = sigma ** 2
+
+    gauss = torch.exp(-norm2 / (2 * sigma2))
+    gauss = gauss / gauss.sum()
+
+    log_kernel = ((norm2 - 2 * sigma2) / (sigma2 ** 2)) * gauss
+    log_kernel = log_kernel - log_kernel.mean()
+    return log_kernel.unsqueeze(0).unsqueeze(0)
+
+
+def compute_hfen(pred: np.ndarray, gt: np.ndarray, device: str = "cpu", kernel_size: int = 15, sigma: float = 1.5) -> float:
+    kernel = create_log_kernel(kernel_size=kernel_size, sigma=sigma, device=device)
+
+    pred_t = torch.from_numpy(pred.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+    gt_t = torch.from_numpy(gt.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+
+    pred_f = F.conv2d(pred_t, kernel, padding=kernel_size // 2)
+    gt_f = F.conv2d(gt_t, kernel, padding=kernel_size // 2)
+
+    num = torch.norm(pred_f - gt_f, p=2).item()
+    den = torch.norm(gt_f, p=2).item() + 1e-12
+    return float(num / den)
+
+
+def evaluate_pair(pred_norm_eval: np.ndarray, gt_norm: np.ndarray, ssim_metric: SSIMMetric, metric_space: str, device: str):
+    psnr = compute_psnr_norm(pred_norm_eval, gt_norm)
+    ssim = compute_ssim_norm(pred_norm_eval, gt_norm, ssim_metric, device)
+
+    if metric_space == "hu":
+        pred_eval = norm_to_hu(pred_norm_eval)
+        gt_eval = norm_to_hu(gt_norm)
+    elif metric_space == "norm":
+        pred_eval = pred_norm_eval
+        gt_eval = gt_norm
+    else:
+        raise ValueError("metric_space must be 'hu' or 'norm'")
+
+    mae = compute_mae(pred_eval, gt_eval)
+    rmse = compute_rmse(pred_eval, gt_eval)
+    nrmse = compute_nrmse(pred_eval, gt_eval, mode="range")
+    hfen = compute_hfen(pred_eval, gt_eval, device="cpu")
+
+    return {
+        "PSNR": psnr,
+        "SSIM": ssim,
+        "MAE": mae,
+        "RMSE": rmse,
+        "NRMSE": nrmse,
+        "HFEN": hfen,
+    }
+
+
+# =========================
+# 5. 可视化
+# =========================
+
+def find_roi_by_error(gt_hu: np.ndarray, pred_hu: np.ndarray, roi_size: int = 128):
+    h, w = gt_hu.shape
+    diff = np.abs(pred_hu - gt_hu)
+
+    if h < roi_size or w < roi_size:
+        return 0, 0, min(h, roi_size), min(w, roi_size)
+
+    step = max(roi_size // 4, 16)
+    best_score = -1.0
+    best_xy = (0, 0)
+
+    for y in range(0, h - roi_size + 1, step):
+        for x in range(0, w - roi_size + 1, step):
+            score = diff[y:y + roi_size, x:x + roi_size].mean()
+            if score > best_score:
+                best_score = score
+                best_xy = (y, x)
+
+    return best_xy[0], best_xy[1], roi_size, roi_size
+
+
+def get_center_roi(h: int, w: int, roi_size: int = 128):
+    rh = min(h, roi_size)
+    rw = min(w, roi_size)
+    y = max((h - rh) // 2, 0)
+    x = max((w - rw) // 2, 0)
+    return y, x, rh, rw
+
+
+def save_visualization(
+    save_path: Path,
+    qd_hu: np.ndarray,
+    gt_hu: np.ndarray,
+    pred_hu: np.ndarray,
+    patient_id: str,
+    slice_idx: int,
+    metrics: dict,
+):
+    diff_hu = pred_hu - gt_hu
+    h, w = gt_hu.shape
+
+    if AUTO_ROI_BY_ERROR:
+        ry, rx, rh, rw = find_roi_by_error(gt_hu, pred_hu, ROI_SIZE)
+    else:
+        ry, rx, rh, rw = get_center_roi(h, w, ROI_SIZE)
+
+    gt_roi = gt_hu[ry:ry + rh, rx:rx + rw]
+    pred_roi = pred_hu[ry:ry + rh, rx:rx + rw]
+    diff_roi = diff_hu[ry:ry + rh, rx:rx + rw]
+
+    vmin = CLIP_MIN
+    vmax = CLIP_MAX
+
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+
+    axes[0, 0].imshow(qd_hu, cmap="gray", vmin=vmin, vmax=vmax)
+    axes[0, 0].set_title("QD input")
+    axes[0, 0].add_patch(plt.Rectangle((rx, ry), rw, rh, fill=False, edgecolor="yellow", linewidth=1.5))
+    axes[0, 0].axis("off")
+
+    axes[0, 1].imshow(gt_hu, cmap="gray", vmin=vmin, vmax=vmax)
+    axes[0, 1].set_title("FD / GT")
+    axes[0, 1].add_patch(plt.Rectangle((rx, ry), rw, rh, fill=False, edgecolor="yellow", linewidth=1.5))
+    axes[0, 1].axis("off")
+
+    axes[0, 2].imshow(pred_hu, cmap="gray", vmin=vmin, vmax=vmax)
+    axes[0, 2].set_title("Prediction")
+    axes[0, 2].add_patch(plt.Rectangle((rx, ry), rw, rh, fill=False, edgecolor="yellow", linewidth=1.5))
+    axes[0, 2].axis("off")
+
+    im = axes[0, 3].imshow(diff_hu, cmap="bwr", vmin=-DIFF_VMAX_HU, vmax=DIFF_VMAX_HU)
+    axes[0, 3].set_title("Diff (Pred - GT)")
+    axes[0, 3].axis("off")
+    plt.colorbar(im, ax=axes[0, 3], fraction=0.046, pad=0.04)
+
+    axes[1, 0].imshow(gt_roi, cmap="gray", vmin=vmin, vmax=vmax)
+    axes[1, 0].set_title("GT ROI")
+    axes[1, 0].axis("off")
+
+    axes[1, 1].imshow(pred_roi, cmap="gray", vmin=vmin, vmax=vmax)
+    axes[1, 1].set_title("Pred ROI")
+    axes[1, 1].axis("off")
+
+    im2 = axes[1, 2].imshow(diff_roi, cmap="bwr", vmin=-DIFF_VMAX_HU, vmax=DIFF_VMAX_HU)
+    axes[1, 2].set_title("Diff ROI")
+    axes[1, 2].axis("off")
+    plt.colorbar(im2, ax=axes[1, 2], fraction=0.046, pad=0.04)
+
+    axes[1, 3].axis("off")
+    text = (
+        f"Patient: {patient_id}\n"
+        f"Slice: {slice_idx}\n"
+        f"PSNR : {metrics['PSNR']:.4f}\n"
+        f"SSIM : {metrics['SSIM']:.6f}\n"
+        f"MAE  : {metrics['MAE']:.4f}\n"
+        f"RMSE : {metrics['RMSE']:.4f}\n"
+        f"NRMSE: {metrics['NRMSE']:.6f}\n"
+        f"HFEN : {metrics['HFEN']:.6f}\n"
+    )
+    axes[1, 3].text(0.02, 0.98, text, va="top", ha="left", fontsize=12)
+
+    fig.suptitle(f"{patient_id} | slice {slice_idx}", fontsize=14)
+    plt.tight_layout()
+    fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+# =========================
+# 6. external_test
+# =========================
+
+@torch.no_grad()
+def run_external_test(model: nn.Module, patient_ids: List[str], device: str):
+    out_dir = Path(SAVE_ROOT) / "external_test" / "pred_npy"
+    ensure_dir(out_dir)
+
+    thickness_id = THICKNESS_TO_ID["1mm"]
+
+    for patient_id in tqdm(patient_ids, desc="External inference", ncols=120):
+        qd_dir = Path(TEST_QD_ROOT) / patient_id / "quarter_1mm"
+        qd_series = load_dicom_series(qd_dir)
+        if not qd_series:
+            print(f"❌ external {patient_id}: 空")
+            continue
+
+        patient_out = out_dir / patient_id
+        ensure_dir(patient_out)
+
+        for i, ds in enumerate(qd_series):
+            qd_hu = dicom_to_hu(ds)
+            qd_crop_hu, _ = center_crop_to_multiple(qd_hu, PATCH_SIZE)
+            qd_norm = hu_to_norm(qd_crop_hu)
+
+            pred_norm_raw = predict_full_slice_raw(
+                model=model,
+                qd_norm=qd_norm,
+                patch_size=PATCH_SIZE,
+                device=device,
+                thickness_id=thickness_id,
+                batch_size=8,
+            )
+            pred_norm_eval = postprocess_prediction_for_metric(pred_norm_raw)
+            pred_hu_eval = norm_to_hu(pred_norm_eval)
+
+            if SAVE_RAW_PRED:
+                np.save(patient_out / f"{patient_id}_s{i:03d}_pred_norm_raw.npy", pred_norm_raw.astype(np.float32))
+
+            np.save(patient_out / f"{patient_id}_s{i:03d}_pred_norm_eval.npy", pred_norm_eval.astype(np.float32))
+            np.save(patient_out / f"{patient_id}_s{i:03d}_pred_hu_eval.npy", pred_hu_eval.astype(np.float32))
+
+    print(f"[INFO] external_test 推理完成，结果保存在: {out_dir}")
+
+
+# =========================
+# 7. 主流程
+# =========================
+
+def build_model_and_load_ckpt(ckpt_path: str, device: str):
+    model = UNet(
+        in_channels=2 if COND_THICKNESS else 1,
+        out_channels=1,
+        base_ch=64,
+        deep_supervision=True,
+    ).to(device)
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    if isinstance(ckpt, dict) and "model_state" in ckpt:
+        model.load_state_dict(ckpt["model_state"])
+    else:
+        model.load_state_dict(ckpt)
+
+    model.eval()
+    print(f"[INFO] Checkpoint loaded from: {ckpt_path}")
+    print(f"[INFO] cond_thickness={COND_THICKNESS}, model_in_channels={2 if COND_THICKNESS else 1}")
+    print(f"[INFO] deep_supervision=True, sigmoid_output=False, use_residual=True")
+    return model
+
+
+def summarize_metrics(records: List[dict]):
+    keys = ["PSNR", "SSIM", "MAE", "RMSE", "NRMSE", "HFEN"]
     summary = {}
     for k in keys:
         vals = [r[k] for r in records]
@@ -276,290 +661,163 @@ def summarize_metrics(records: List[dict], keys: List[str]):
     return summary
 
 
-# ================== 模型 & 数据 ==================
-def build_model_and_load_ckpt(ckpt_path: Path, device: torch.device):
-    model = UNet(
-        in_channels=MODEL_IN_CHANNELS,
-        out_channels=1,
-        base_ch=64,
-        deep_supervision=DEEP_SUPERVISION,
-    ).to(device)
-
-    ckpt = torch.load(str(ckpt_path), map_location=device)
-
-    if isinstance(ckpt, dict):
-        if "model_state" in ckpt:
-            state_dict = ckpt["model_state"]
-        elif "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        else:
-            state_dict = ckpt
-    else:
-        state_dict = ckpt
-
-    model.load_state_dict(state_dict)
-    model.eval()
-
-    print(f"[INFO] Checkpoint loaded from: {ckpt_path}")
-    return model
-
-
-def build_eval_loader(eval_thickness: str) -> Tuple[LDCTPatchNPYDataset, DataLoader]:
-    dataset = LDCTPatchNPYDataset(
-        root=PREPARED_ROOT,
-        split=EVAL_SPLIT,
-        thickness=eval_thickness,
-        cond_thickness=COND_THICKNESS,
-    )
-
-    if len(dataset) == 0:
-        raise RuntimeError(
-            f"[ERROR] eval dataset 长度为 0，请检查: "
-            f"split={EVAL_SPLIT}, thickness={eval_thickness}, root={PREPARED_ROOT}"
-        )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=(DEVICE.type == "cuda"),
-    )
-    return dataset, loader
-
-
-# ================== 主评估逻辑 ==================
-@torch.no_grad()
-def evaluate(model, loader, ssim_metric, device, eval_thickness: str):
-    all_records = []
-
-    for batch_idx, batch in enumerate(tqdm(loader, desc=f"Evaluating {EVAL_SPLIT}-{eval_thickness}", ncols=120)):
-        if not isinstance(batch, (list, tuple)) or len(batch) != 2:
-            raise RuntimeError(
-                "[ERROR] 当前脚本期望 DataLoader 返回 (qd, fd)。"
-                "如果你后续改了 Dataset 返回格式，需要同步修改 eval 脚本。"
-            )
-
-        qd, fd = batch
-        qd = qd.to(device, non_blocking=True)
-        fd = fd.to(device, non_blocking=True)
-
-        outputs = model(qd)
-        out = outputs["main"] if isinstance(outputs, dict) else outputs
-
-        out = out.float()
-        fd = fd.float()
-
-        if CLIP_PRED_BEFORE_METRIC:
-            out = torch.clamp(out, 0.0, 1.0)
-
-        psnr_list = compute_psnr_from_torch(out, fd)
-        ssim_list = compute_ssim_batch(out, fd, ssim_metric)
-
-        out_np = out.squeeze(1).cpu().numpy().astype(np.float32)
-        fd_np = fd.squeeze(1).cpu().numpy().astype(np.float32)
-
-        for i in range(out_np.shape[0]):
-            pred_norm = out_np[i]
-            gt_norm = fd_np[i]
-
-            if METRIC_SPACE_FOR_MAE_RMSE_NRMSE_HFEN == "hu":
-                pred_eval = norm_to_hu(pred_norm)
-                gt_eval = norm_to_hu(gt_norm)
-            elif METRIC_SPACE_FOR_MAE_RMSE_NRMSE_HFEN == "norm":
-                pred_eval = pred_norm
-                gt_eval = gt_norm
-            else:
-                raise ValueError("METRIC_SPACE_FOR_MAE_RMSE_NRMSE_HFEN must be 'hu' or 'norm'")
-
-            mae = compute_mae(pred_eval, gt_eval)
-            rmse = compute_rmse(pred_eval, gt_eval)
-            nrmse = compute_nrmse(pred_eval, gt_eval, mode="range")
-            hfen = compute_hfen(
-                pred_eval,
-                gt_eval,
-                kernel_size=HFEN_KERNEL_SIZE,
-                sigma=HFEN_SIGMA,
-            )
-
-            rec = {
-                "global_patch_idx": batch_idx * BATCH_SIZE + i,
-                "thickness": eval_thickness,
-                "pred_min_after_postprocess": float(pred_norm.min()),
-                "pred_max_after_postprocess": float(pred_norm.max()),
-                "gt_min": float(gt_norm.min()),
-                "gt_max": float(gt_norm.max()),
-                "PSNR": float(psnr_list[i]),
-                "SSIM": float(ssim_list[i]),
-                "MAE": float(mae),
-                "RMSE": float(rmse),
-                "NRMSE": float(nrmse),
-                "HFEN": float(hfen),
-            }
-            all_records.append(rec)
-
-    return all_records
-
-
-def evaluate_one_thickness(model, ssim_metric, device, eval_thickness: str):
-    _, loader = build_eval_loader(eval_thickness)
-    records = evaluate(model, loader, ssim_metric, device, eval_thickness)
-
-    metric_keys = ["PSNR", "SSIM", "MAE", "RMSE", "NRMSE", "HFEN"]
-    summary = summarize_metrics(records, metric_keys)
-
-    save_dir = SAVE_ROOT / eval_thickness
-    ensure_dir(save_dir)
-
-    records_path = save_dir / f"patch_level_metrics_{EVAL_SPLIT}_{eval_thickness}.json"
-    summary_path = save_dir / f"summary_{EVAL_SPLIT}_{eval_thickness}.json"
-
-    summary_json = {
-        "exp_name": EXP_NAME,
-        "seed": SEED,
-        "checkpoint_path": str(CKPT_PATH),
-        "eval_split": EVAL_SPLIT,
-        "eval_thickness": eval_thickness,
-        "train_thickness": TRAIN_THICKNESS,
-        "val_thickness": VAL_THICKNESS,
-        "cond_thickness": COND_THICKNESS,
-        "model_in_channels": MODEL_IN_CHANNELS,
-        "deep_supervision": DEEP_SUPERVISION,
-        "sigmoid_output": SIGMOID_OUTPUT,
-        "ds_weights": DS_WEIGHTS,
-        "metric_space_for_MAE_RMSE_NRMSE_HFEN": METRIC_SPACE_FOR_MAE_RMSE_NRMSE_HFEN,
-        "clip_min": CLIP_MIN,
-        "clip_max": CLIP_MAX,
-        "clip_pred_before_metric": CLIP_PRED_BEFORE_METRIC,
-        "hfen_kernel_size": HFEN_KERNEL_SIZE,
-        "hfen_sigma": HFEN_SIGMA,
-        "num_patches": len(records),
-        "patch_level_summary": summary,
-    }
-
-    with open(records_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
-
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary_json, f, indent=2, ensure_ascii=False)
-
-    return records, summary
-
-
 def main():
-    set_seed(SEED)
-
-    if not PREPARED_ROOT.exists():
-        raise FileNotFoundError(f"[ERROR] PREPARED_ROOT 不存在: {PREPARED_ROOT}")
-
-    if not CKPT_PATH.exists():
-        raise FileNotFoundError(f"[ERROR] CKPT_PATH 不存在: {CKPT_PATH}")
-
-    ensure_dir(SAVE_ROOT)
-
-    print(f"[INFO] DEVICE = {DEVICE}")
-    print(f"[INFO] PREPARED_ROOT = {PREPARED_ROOT}")
-    print(f"[INFO] SPLIT_DIR = {SPLIT_DIR}")
-    print(f"[INFO] CKPT_PATH = {CKPT_PATH}")
-    print(f"[INFO] SAVE_ROOT = {SAVE_ROOT}")
-    print(f"[INFO] EVAL_SPLIT = {EVAL_SPLIT}")
-    print(f"[INFO] EVAL_THICKNESSES = {EVAL_THICKNESSES}")
-    print(f"[INFO] TRAIN_THICKNESS = {TRAIN_THICKNESS}")
-    print(f"[INFO] VAL_THICKNESS = {VAL_THICKNESS}")
-    print(f"[INFO] COND_THICKNESS = {COND_THICKNESS}")
-    print(f"[INFO] MODEL_IN_CHANNELS = {MODEL_IN_CHANNELS}")
-    print(f"[INFO] DEEP_SUPERVISION = {DEEP_SUPERVISION}")
-    print(f"[INFO] SIGMOID_OUTPUT = {SIGMOID_OUTPUT}")
-    print(f"[INFO] DS_WEIGHTS = {DS_WEIGHTS}")
-    print(f"[INFO] METRIC_SPACE_FOR_MAE_RMSE_NRMSE_HFEN = {METRIC_SPACE_FOR_MAE_RMSE_NRMSE_HFEN}")
+    ensure_dir(Path(SAVE_ROOT))
 
     model = build_model_and_load_ckpt(CKPT_PATH, DEVICE)
     ssim_metric = SSIMMetric(window_size=11).to(DEVICE)
 
-    all_records_merged = []
-    per_thickness_summary = {}
+    splits = load_splits(SPLIT_JSON)
+    patient_ids = splits.get(EVAL_SPLIT, [])
 
-    for eval_thickness in EVAL_THICKNESSES:
-        print("\n" + "-" * 90)
-        print(f"[INFO] Evaluating thickness = {eval_thickness}")
-        print("-" * 90)
+    if EVAL_SPLIT == "external_test":
+        run_external_test(model, patient_ids, DEVICE)
+        return
 
-        records, summary = evaluate_one_thickness(
-            model=model,
-            ssim_metric=ssim_metric,
-            device=DEVICE,
-            eval_thickness=eval_thickness,
-        )
+    assert EVAL_SPLIT in ["train", "val", "test"]
+    assert EVAL_THICKNESS in ["1mm", "3mm"]
 
-        all_records_merged.extend(records)
-        per_thickness_summary[eval_thickness] = {
-            "num_patches": len(records),
-            "patch_level_summary": summary,
-        }
+    result_dir = Path(SAVE_ROOT) / EVAL_SPLIT / EVAL_THICKNESS
+    vis_dir = result_dir / "vis"
+    ensure_dir(result_dir)
+    ensure_dir(vis_dir)
 
-    metric_keys = ["PSNR", "SSIM", "MAE", "RMSE", "NRMSE", "HFEN"]
-    merged_summary = summarize_metrics(all_records_merged, metric_keys)
+    all_slice_records = []
+    patient_level_records = []
 
-    merged_summary_json = {
+    thickness_id = THICKNESS_TO_ID[EVAL_THICKNESS]
+
+    for patient_id in tqdm(patient_ids, desc=f"Evaluating {EVAL_SPLIT}-{EVAL_THICKNESS}", ncols=120):
+        fd_dir = Path(FD_ROOTS[EVAL_THICKNESS]) / patient_id / f"full_{EVAL_THICKNESS}"
+        qd_dir = Path(QD_ROOTS[EVAL_THICKNESS]) / patient_id / f"quarter_{EVAL_THICKNESS}"
+
+        fd_series = load_dicom_series(fd_dir)
+        qd_series = load_dicom_series(qd_dir)
+
+        if not fd_series or not qd_series:
+            print(f"❌ {patient_id} {EVAL_THICKNESS}: FD/QD 缺失，跳过")
+            continue
+
+        pairs = match_fd_qd_pairs(fd_series, qd_series)
+        if not pairs:
+            print(f"❌ {patient_id} {EVAL_THICKNESS}: 无法配对切片，跳过")
+            continue
+
+        patient_slice_records = []
+        vis_saved = 0
+
+        for i, (fd_ds, qd_ds) in enumerate(pairs):
+            fd_hu = dicom_to_hu(fd_ds)
+            qd_hu = dicom_to_hu(qd_ds)
+
+            fd_crop_hu, _ = center_crop_to_multiple(fd_hu, PATCH_SIZE)
+            qd_crop_hu, _ = center_crop_to_multiple(qd_hu, PATCH_SIZE)
+
+            fd_norm = hu_to_norm(fd_crop_hu)
+            qd_norm = hu_to_norm(qd_crop_hu)
+
+            pred_norm_raw = predict_full_slice_raw(
+                model=model,
+                qd_norm=qd_norm,
+                patch_size=PATCH_SIZE,
+                device=DEVICE,
+                thickness_id=thickness_id,
+                batch_size=8,
+            )
+            pred_norm_eval = postprocess_prediction_for_metric(pred_norm_raw)
+
+            metrics = evaluate_pair(pred_norm_eval, fd_norm, ssim_metric, METRIC_SPACE, DEVICE)
+
+            slice_record = {
+                "patient_id": patient_id,
+                "slice_idx": i,
+                "thickness": EVAL_THICKNESS,
+                "thickness_id": int(thickness_id),
+                "pred_min_raw": float(np.min(pred_norm_raw)),
+                "pred_max_raw": float(np.max(pred_norm_raw)),
+                "pred_min_eval": float(np.min(pred_norm_eval)),
+                "pred_max_eval": float(np.max(pred_norm_eval)),
+                **metrics
+            }
+            all_slice_records.append(slice_record)
+            patient_slice_records.append(slice_record)
+
+            if SAVE_VIS and vis_saved < VIS_PER_PATIENT_MAX:
+                pred_hu_eval = norm_to_hu(pred_norm_eval)
+                save_path = vis_dir / f"{patient_id}_s{i:03d}.png"
+                save_visualization(
+                    save_path=save_path,
+                    qd_hu=qd_crop_hu,
+                    gt_hu=fd_crop_hu,
+                    pred_hu=pred_hu_eval,
+                    patient_id=patient_id,
+                    slice_idx=i,
+                    metrics=metrics,
+                )
+                vis_saved += 1
+
+        if patient_slice_records:
+            patient_summary = {
+                "patient_id": patient_id,
+                "num_slices": len(patient_slice_records),
+            }
+            for key in ["PSNR", "SSIM", "MAE", "RMSE", "NRMSE", "HFEN"]:
+                vals = [x[key] for x in patient_slice_records]
+                patient_summary[key] = float(np.mean(vals))
+            patient_level_records.append(patient_summary)
+
+    slice_json = result_dir / f"slice_metrics_{EXP_NAME}_seed{SEED}.json"
+    with open(slice_json, "w", encoding="utf-8") as f:
+        json.dump(all_slice_records, f, indent=2, ensure_ascii=False)
+
+    patient_json = result_dir / f"patient_metrics_{EXP_NAME}_seed{SEED}.json"
+    with open(patient_json, "w", encoding="utf-8") as f:
+        json.dump(patient_level_records, f, indent=2, ensure_ascii=False)
+
+    summary = {
         "exp_name": EXP_NAME,
         "seed": SEED,
-        "checkpoint_path": str(CKPT_PATH),
+        "checkpoint_path": CKPT_PATH,
         "eval_split": EVAL_SPLIT,
-        "eval_thicknesses": EVAL_THICKNESSES,
+        "eval_thickness": EVAL_THICKNESS,
         "train_thickness": TRAIN_THICKNESS,
         "val_thickness": VAL_THICKNESS,
         "cond_thickness": COND_THICKNESS,
-        "model_in_channels": MODEL_IN_CHANNELS,
-        "deep_supervision": DEEP_SUPERVISION,
-        "sigmoid_output": SIGMOID_OUTPUT,
-        "ds_weights": DS_WEIGHTS,
-        "metric_space_for_MAE_RMSE_NRMSE_HFEN": METRIC_SPACE_FOR_MAE_RMSE_NRMSE_HFEN,
+        "model_in_channels": 2 if COND_THICKNESS else 1,
+        "metric_space_for_MAE_RMSE_NRMSE_HFEN": METRIC_SPACE,
         "clip_min": CLIP_MIN,
         "clip_max": CLIP_MAX,
+        "patch_size": PATCH_SIZE,
         "clip_pred_before_metric": CLIP_PRED_BEFORE_METRIC,
-        "hfen_kernel_size": HFEN_KERNEL_SIZE,
-        "hfen_sigma": HFEN_SIGMA,
-        "num_patches_total": len(all_records_merged),
-        "per_thickness_summary": per_thickness_summary,
-        "merged_patch_level_summary": merged_summary,
+        "loss": "L1",
+        "deep_supervision": True,
+        "model_output_activation": "none",
+        "use_residual": True,
+        "model_prediction_type": "main_branch_linear_residual",
+        "thickness_mapping": {
+            "1mm": 0,
+            "3mm": 1,
+        },
+        "num_patients": len(patient_level_records),
+        "num_slices": len(all_slice_records),
+        "slice_level_summary": summarize_metrics(all_slice_records),
+        "patient_level_summary": summarize_metrics(patient_level_records),
+        "save_raw_pred": SAVE_RAW_PRED,
     }
 
-    merged_records_path = SAVE_ROOT / f"patch_level_metrics_{EVAL_SPLIT}_merged.json"
-    merged_summary_path = SAVE_ROOT / f"summary_{EVAL_SPLIT}_merged.json"
+    summary_json = result_dir / f"summary_{EXP_NAME}_seed{SEED}.json"
+    with open(summary_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    with open(merged_records_path, "w", encoding="utf-8") as f:
-        json.dump(all_records_merged, f, indent=2, ensure_ascii=False)
-
-    with open(merged_summary_path, "w", encoding="utf-8") as f:
-        json.dump(merged_summary_json, f, indent=2, ensure_ascii=False)
-
-    print("\n" + "=" * 90)
-    print("[INFO] Evaluation finished.")
-    print(f"[INFO] merged patch metrics saved to: {merged_records_path}")
-    print(f"[INFO] merged summary saved to     : {merged_summary_path}")
-    print("=" * 90)
-
-    for th in EVAL_THICKNESSES:
-        print(f"\n[RESULT] Thickness = {th}")
-        th_summary = per_thickness_summary[th]["patch_level_summary"]
-        for k, v in th_summary.items():
-            print(
-                f"{k:>6s} | "
-                f"mean={v['mean']:.6f} | "
-                f"std={v['std']:.6f} | "
-                f"min={v['min']:.6f} | "
-                f"max={v['max']:.6f}"
-            )
-
-    print(f"\n[RESULT] Merged ({'+'.join(EVAL_THICKNESSES)})")
-    for k, v in merged_summary.items():
-        print(
-            f"{k:>6s} | "
-            f"mean={v['mean']:.6f} | "
-            f"std={v['std']:.6f} | "
-            f"min={v['min']:.6f} | "
-            f"max={v['max']:.6f}"
-        )
+    print("\n" + "=" * 100)
+    print(f"[INFO] Evaluation finished")
+    print(f"[INFO] exp_name={EXP_NAME}")
+    print(f"[INFO] split={EVAL_SPLIT}, thickness={EVAL_THICKNESS}")
+    print(f"[INFO] train_thickness={TRAIN_THICKNESS}, val_thickness={VAL_THICKNESS}")
+    print(f"[INFO] cond_thickness={COND_THICKNESS}, model_in_channels={2 if COND_THICKNESS else 1}")
+    print(f"[INFO] slices={summary['num_slices']}, patients={summary['num_patients']}")
+    print(f"[INFO] summary saved to: {summary_json}")
+    print("=" * 100)
 
 
 if __name__ == "__main__":
