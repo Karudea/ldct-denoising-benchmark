@@ -19,7 +19,7 @@ from ldct_model import UNet
 # =========================
 
 # ---- 实验命名（和 train 保持一致）----
-EXP_NAME = "A2_C4_sigmoid_trainall_valall"
+EXP_NAME = "A3_C4_residual_sigmoid_trainall_valall"
 SEED = 0
 
 # ---- 数据路径 ----
@@ -35,7 +35,7 @@ SAVE_ROOT = rf"E:\LDCT\eval_results\{EXP_NAME}_seed{SEED}"
 
 # ---- 评估设置 ----
 EVAL_SPLIT = "test"          # "train" | "val" | "test" | "external_test"
-EVAL_THICKNESS = "1mm"       # "1mm" | "3mm"
+EVAL_THICKNESS = "3mm"       # "1mm" | "3mm"
 PATCH_SIZE = 256
 
 # ---- 与训练对应的 thickness 信息（仅用于记录）----
@@ -59,7 +59,9 @@ CLIP_MAX = 240.0
 METRIC_SPACE = "hu"
 
 # ---- 预测后处理 ----
-# A2 是 sigmoid 输出，理论上范围已在 [0,1]
+# A3 residual + sigmoid:
+# 训练代码里 model 输出已经是 sigmoid 后结果（范围一般应在 [0,1]）
+# 这里保留 clip，作为数值安全保护
 CLIP_PRED_BEFORE_METRIC = True
 SAVE_RAW_PRED = True   # external_test 时额外保存 raw prediction
 
@@ -262,6 +264,13 @@ def build_model_input_batch(
 # =========================
 
 def image_to_patches(img: np.ndarray, patch_size: int):
+    """
+    img: (H, W)
+    return:
+      patches: (N, patch_size, patch_size)
+      coords : [(y, x), ...]
+      hw     : (H, W)
+    """
     h, w = img.shape
     patches = []
     coords = []
@@ -306,9 +315,9 @@ def predict_full_slice_raw(
     preds = []
 
     for i in range(0, len(patches), batch_size):
-        batch = patches[i:i + batch_size]
+        batch = patches[i:i + batch_size]  # (N,H,W)
         batch_t = build_model_input_batch(batch, thickness_id, device)
-        out = model(batch_t)
+        out = model(batch_t)               # (N,1,H,W)
         out = out.squeeze(1).cpu().numpy().astype(np.float32)
         preds.append(out)
 
@@ -328,6 +337,10 @@ def postprocess_prediction_for_metric(pred_norm_raw: np.ndarray) -> np.ndarray:
 # =========================
 
 class SSIMMetric(nn.Module):
+    """
+    返回 SSIM 值（不是 loss）
+    输入: [N,1,H,W]，范围默认 [0,1]
+    """
     def __init__(self, window_size=11):
         super().__init__()
         self.window_size = window_size
@@ -466,7 +479,7 @@ def evaluate_pair(pred_norm_eval: np.ndarray, gt_norm: np.ndarray, ssim_metric: 
 
 
 # =========================
-# 5. 可视化
+# 5. 结构核查可视化
 # =========================
 
 def find_roi_by_error(gt_hu: np.ndarray, pred_hu: np.ndarray, roi_size: int = 128):
@@ -577,7 +590,7 @@ def save_visualization(
 
 
 # =========================
-# 6. external_test
+# 6. external_test 纯推理导出
 # =========================
 
 @torch.no_grad()
@@ -585,6 +598,7 @@ def run_external_test(model: nn.Module, patient_ids: List[str], device: str):
     out_dir = Path(SAVE_ROOT) / "external_test" / "pred_npy"
     ensure_dir(out_dir)
 
+    # external_test 默认走 1mm 分支
     thickness_id = THICKNESS_TO_ID["1mm"]
 
     for patient_id in tqdm(patient_ids, desc="External inference", ncols=120):
@@ -623,7 +637,7 @@ def run_external_test(model: nn.Module, patient_ids: List[str], device: str):
 
 
 # =========================
-# 7. 主流程
+# 7. 主评估流程
 # =========================
 
 def build_model_and_load_ckpt(ckpt_path: str, device: str):
@@ -644,7 +658,7 @@ def build_model_and_load_ckpt(ckpt_path: str, device: str):
     model.eval()
     print(f"[INFO] Checkpoint loaded from: {ckpt_path}")
     print(f"[INFO] cond_thickness={COND_THICKNESS}, model_in_channels={2 if COND_THICKNESS else 1}")
-    print(f"[INFO] use_sigmoid=True, residual_learning=False")
+    print(f"[INFO] use_sigmoid=True, residual_learning=True")
     return model
 
 
@@ -792,8 +806,8 @@ def main():
         "clip_pred_before_metric": CLIP_PRED_BEFORE_METRIC,
         "loss": "L1",
         "model_output_activation": "sigmoid",
-        "use_residual": False,
-        "model_prediction_type": "direct_sigmoid_output",
+        "use_residual": True,
+        "model_prediction_type": "sigmoid_output_residual_variant",
         "thickness_mapping": {
             "1mm": 0,
             "3mm": 1,
