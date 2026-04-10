@@ -30,8 +30,9 @@ QD_ROOTS = {
     "3mm": r"E:\LDCT\Training_Image_Data\1mm B30\quarter_3mm",
 }
 
-CKPT_PATH = r"E:\LDCT\experiments\C1_3_mixed_cond_th_nosigmoid_l1only\best_unet.pth"
-SAVE_ROOT = r"E:\LDCT\eval_results\A2_browser_index_target_cases"
+# A3 checkpoint
+CKPT_PATH = r"E:\LDCT\experiments\A3_C4_residual_sigmoid_trainall_valall\seed_0\best_A3_C4_residual_sigmoid_trainall_valall_seed0.pth"
+SAVE_ROOT = r"E:\LDCT\eval_results\A3_browser_index_target_cases"
 
 PATCH_SIZE = 256
 INFER_BATCH_SIZE = 8
@@ -190,37 +191,27 @@ def export_single_like_browser(ds, save_path):
 
 
 def compute_msssim_norm(pred_norm: np.ndarray, gt_norm: np.ndarray, device: str) -> float:
-    """
-    计算 MS-SSIM（基于 [0,1] 归一化空间）
-    输入: 2D numpy array, shape [H, W]
-    """
     pred_t = torch.from_numpy(pred_norm.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
     gt_t = torch.from_numpy(gt_norm.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
 
-    # PIQ 要求输入范围与 data_range 一致；这里 pred_norm / gt_norm 已经是 [0,1]
     val = piq.multi_scale_ssim(
         pred_t,
         gt_t,
         data_range=1.0,
-        reduction='mean'
+        reduction="mean"
     )
     return float(val.item())
 
 
 def compute_vif_norm(pred_norm: np.ndarray, gt_norm: np.ndarray, device: str) -> float:
-    """
-    计算 VIFp（基于 [0,1] 归一化空间）
-    输入: 2D numpy array, shape [H, W]
-    """
     pred_t = torch.from_numpy(pred_norm.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
     gt_t = torch.from_numpy(gt_norm.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
 
-    # PIQ 的 VIFp 也是 full-reference 指标，输入顺序为 distorted, reference
     val = piq.vif_p(
         pred_t,
         gt_t,
         data_range=1.0,
-        reduction='mean'
+        reduction="mean"
     )
     return float(val.item())
 
@@ -339,6 +330,7 @@ def predict_full_slice(
     infer_batch_size: int,
     cond_thickness: bool,
     thickness: str,
+    residual_learning: bool = False,
     stride: int = PATCH_STRIDE,
     gaussian_sigma_ratio: float = GAUSSIAN_SIGMA_RATIO,
 ):
@@ -372,6 +364,10 @@ def predict_full_slice(
             x = q_batch_t
 
         out = model(x)
+
+        # 这里不额外做 residual 回加：
+        # 因为训练脚本中是直接 out = model(qd)，然后与 fd 做 L1；
+        # 若 residual 已在模型内部实现，这里会自然生效。
         out = out.squeeze(1).cpu().numpy().astype(np.float32)
         preds.append(out)
 
@@ -506,13 +502,11 @@ def compute_hfen(pred: np.ndarray, gt: np.ndarray, device: str = "cpu", kernel_s
 
 
 def evaluate_pair(pred_norm: np.ndarray, gt_norm: np.ndarray, ssim_metric: SSIMMetric, metric_space: str, device: str):
-    # ---- 先算归一化空间指标 ----
     psnr = compute_psnr_norm(pred_norm, gt_norm)
     ssim = compute_ssim_norm(pred_norm, gt_norm, ssim_metric, device)
     ms_ssim = compute_msssim_norm(pred_norm, gt_norm, device)
     vif = compute_vif_norm(pred_norm, gt_norm, device)
 
-    # ---- 再根据设置决定误差类指标在哪个空间算 ----
     if metric_space == "hu":
         pred_eval = norm_to_hu(pred_norm)
         gt_eval = norm_to_hu(gt_norm)
@@ -775,11 +769,7 @@ def save_single_slice_roi_vis(
     ax.set_ylim(h, 0)
     ax.set_axis_off()
 
-    # =========================
-    # 1mm / 3mm 分开处理
-    # =========================
     if thickness == "1mm":
-        # 1mm：保留主图黄框
         roi_rect = Rectangle(
             (rx, ry),
             rw,
@@ -791,7 +781,6 @@ def save_single_slice_roi_vis(
         )
         ax.add_patch(roi_rect)
 
-        # 1mm：左下角 ROI 放大图保留边框
         inset_border = Rectangle(
             (inset_x, inset_y),
             inset_w,
@@ -803,7 +792,6 @@ def save_single_slice_roi_vis(
         )
         ax.add_patch(inset_border)
 
-        # 1mm：左下角放大图上也画标注
         draw_annotations(
             ax,
             annotations_inset,
@@ -813,15 +801,11 @@ def save_single_slice_roi_vis(
         )
 
     elif thickness == "3mm":
-        # 3mm：不画主图黄框
-        # 3mm：左下角 ROI 放大图不画边框
-        # 3mm：左下角 ROI 放大图也不画红框
         pass
 
     else:
         raise ValueError(f"Unsupported thickness: {thickness}")
 
-    # 主图上的标注始终保留
     draw_annotations(
         ax,
         annotations_main,
@@ -830,29 +814,20 @@ def save_single_slice_roi_vis(
         zorder=100
     )
 
-    # =========================
-    # 左上角 / 右上角文字指标
-    # =========================
     if metrics is None:
         metrics = {}
 
     left_text = "\n".join([
-        f"PSNR: {metrics.get('PSNR', 'N/A'):.4f}" if isinstance(metrics.get("PSNR", None), (
-        int, float)) else f"PSNR: {metrics.get('PSNR', 'N/A')}",
-        f"SSIM: {metrics.get('SSIM', 'N/A'):.4f}" if isinstance(metrics.get("SSIM", None), (
-        int, float)) else f"SSIM: {metrics.get('SSIM', 'N/A')}",
-        f"RMSE: {metrics.get('RMSE', 'N/A'):.4f}" if isinstance(metrics.get("RMSE", None), (
-        int, float)) else f"RMSE: {metrics.get('RMSE', 'N/A')}",
+        f"PSNR: {metrics.get('PSNR', 'N/A'):.4f}" if isinstance(metrics.get("PSNR", None), (int, float)) else f"PSNR: {metrics.get('PSNR', 'N/A')}",
+        f"SSIM: {metrics.get('SSIM', 'N/A'):.4f}" if isinstance(metrics.get("SSIM", None), (int, float)) else f"SSIM: {metrics.get('SSIM', 'N/A')}",
+        f"RMSE: {metrics.get('RMSE', 'N/A'):.4f}" if isinstance(metrics.get("RMSE", None), (int, float)) else f"RMSE: {metrics.get('RMSE', 'N/A')}",
     ])
 
     right_text = "\n".join([
-        f"VIF: {metrics.get('VIF', 'N/A'):.4f}" if isinstance(metrics.get("VIF", None),
-                                                              (int, float)) else f"VIF: {metrics.get('VIF', 'N/A')}",
-        f"MS-SSIM: {metrics.get('MS-SSIM', 'N/A'):.4f}" if isinstance(metrics.get("MS-SSIM", None), (
-        int, float)) else f"MS-SSIM: {metrics.get('MS-SSIM', 'N/A')}",
+        f"VIF: {metrics.get('VIF', 'N/A'):.4f}" if isinstance(metrics.get("VIF", None), (int, float)) else f"VIF: {metrics.get('VIF', 'N/A')}",
+        f"MS-SSIM: {metrics.get('MS-SSIM', 'N/A'):.4f}" if isinstance(metrics.get("MS-SSIM", None), (int, float)) else f"MS-SSIM: {metrics.get('MS-SSIM', 'N/A')}",
     ])
 
-    # 左上角
     ax.text(
         10, 18,
         left_text,
@@ -869,7 +844,6 @@ def save_single_slice_roi_vis(
         )
     )
 
-    # 右上角
     ax.text(
         w - 10, 18,
         right_text,
@@ -911,8 +885,8 @@ def build_model_and_load_ckpt(ckpt_path: str, device: str):
 
     cond_thickness = bool(ckpt.get("cond_thickness", False))
     model_in_channels = int(ckpt.get("model_in_channels", 2 if cond_thickness else 1))
+    residual_learning = bool(ckpt.get("residual_learning", False))
 
-    # 兼容带/不带 use_sigmoid 参数的 UNet
     try:
         use_sigmoid = bool(ckpt.get("use_sigmoid", False))
         model = UNet(
@@ -939,15 +913,17 @@ def build_model_and_load_ckpt(ckpt_path: str, device: str):
     print(f"[INFO] Checkpoint loaded from: {ckpt_path}")
     print(f"[INFO] cond_thickness={cond_thickness}, model_in_channels={model_in_channels}")
     print(f"[INFO] use_sigmoid={use_sigmoid}")
+    print(f"[INFO] residual_learning={residual_learning}")
     print(f"[INFO] exp_name={ckpt.get('exp_name', '')}")
-    return model, ckpt, cond_thickness, model_in_channels, use_sigmoid
+
+    return model, ckpt, cond_thickness, model_in_channels, use_sigmoid, residual_learning
 
 
 # =========================
 # 9. 主流程：严格按浏览图编号推理
 # =========================
 @torch.no_grad()
-def run_target_cases(model: nn.Module, device: str, cond_thickness: bool):
+def run_target_cases(model: nn.Module, device: str, cond_thickness: bool, residual_learning: bool):
     out_dir = Path(SAVE_ROOT) / "target_cases"
     ensure_dir(out_dir)
 
@@ -995,11 +971,10 @@ def run_target_cases(model: nn.Module, device: str, cond_thickness: bool):
             infer_batch_size=INFER_BATCH_SIZE,
             cond_thickness=cond_thickness,
             thickness=thickness,
-            stride=PATCH_STRIDE,
-            gaussian_sigma_ratio=GAUSSIAN_SIGMA_RATIO,
+            residual_learning=residual_learning,
         )
-        pred_hu = norm_to_hu(pred_norm)
 
+        pred_hu = norm_to_hu(pred_norm)
         metrics = evaluate_pair(pred_norm, fd_norm, ssim_metric, METRIC_SPACE, device)
 
         np.save(out_dir / f"{case_name}_qd_hu.npy", qd_crop_hu.astype(np.float32))
@@ -1043,6 +1018,8 @@ def run_target_cases(model: nn.Module, device: str, cond_thickness: bool):
             "patch_size": int(PATCH_SIZE),
             "patch_stride": int(PATCH_STRIDE),
             "gaussian_sigma_ratio": float(GAUSSIAN_SIGMA_RATIO),
+            "cond_thickness": bool(cond_thickness),
+            "residual_learning": bool(residual_learning),
             "metrics": metrics,
         }
         all_results.append(result_item)
@@ -1059,8 +1036,8 @@ def run_target_cases(model: nn.Module, device: str, cond_thickness: bool):
 
 def main():
     ensure_dir(Path(SAVE_ROOT))
-    model, ckpt, cond_thickness, model_in_channels, use_sigmoid = build_model_and_load_ckpt(CKPT_PATH, DEVICE)
-    run_target_cases(model, DEVICE, cond_thickness)
+    model, ckpt, cond_thickness, model_in_channels, use_sigmoid, residual_learning = build_model_and_load_ckpt(CKPT_PATH, DEVICE)
+    run_target_cases(model, DEVICE, cond_thickness, residual_learning)
 
 
 if __name__ == "__main__":
