@@ -54,8 +54,12 @@ SPLIT_DIR = PATHS["split_dir"]
 EXP_ROOT = PATHS["exp_root"]
 
 # ================== 实验配置 ==================
-# C4：mixed + cond thickness + no sigmoid + L1
-EXP_NAME = "unet_C4_mixed_condth_nosigmoid_l1_trainall_valall"
+# !!! 并行实验时请务必保证 EXP_NAME 唯一 !!!
+# 例如：
+# A2: "A2_C4_sigmoid_trainall_valall"
+# A3: "A3_C4_residual_sigmoid_trainall_valall"
+EXP_NAME = "A2_C4_sigmoid_trainall_valall"
+
 SAVE_DIR = EXP_ROOT / EXP_NAME
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -78,7 +82,10 @@ TRAIN_THICKNESS = "all"        # C4 mixed train
 VAL_THICKNESS = "all"          # 1mm + 3mm 共同验证 / eval
 COND_THICKNESS = True
 MODEL_IN_CHANNELS = 2 if COND_THICKNESS else 1
-USE_SIGMOID = False
+
+# A2 sigmoid 这里应为 True
+# A3 residual+sigmoid 如果模型仍然需要 sigmoid 输出，这里也应为 True
+USE_SIGMOID = True
 
 torch.backends.cudnn.benchmark = True
 
@@ -115,6 +122,38 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     return float(10 * np.log10(1.0 / mse))
 
 
+def get_output_activation_name(use_sigmoid: bool) -> str:
+    return "sigmoid" if use_sigmoid else "none"
+
+
+def create_grad_scaler(device: torch.device):
+    """
+    兼容新旧 PyTorch：
+    - 新版: torch.amp.GradScaler("cuda", ...)
+    - 旧版: torch.cuda.amp.GradScaler(...)
+    """
+    if device.type != "cuda":
+        return None
+
+    try:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except Exception:
+        return torch.cuda.amp.GradScaler(enabled=True)
+
+
+def autocast_context(device: torch.device):
+    """
+    兼容新旧 PyTorch autocast
+    """
+    if device.type != "cuda":
+        return torch.cuda.amp.autocast(enabled=False)
+
+    try:
+        return torch.amp.autocast("cuda", enabled=True)
+    except Exception:
+        return torch.cuda.amp.autocast(enabled=True)
+
+
 def train_one_epoch(model, loader, optimizer, scaler, l1_fn, device):
     model.train()
     running_l1 = 0.0
@@ -125,17 +164,23 @@ def train_one_epoch(model, loader, optimizer, scaler, l1_fn, device):
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with autocast_context(device):
             out = model(qd)
             loss = l1_fn(out, fd)
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        if device.type == "cuda" and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         running_l1 += loss.item()
 
     n = len(loader)
+    if n == 0:
+        raise RuntimeError("[ERROR] train_loader 为空，无法训练。请检查 prepared_root / split / thickness 设置。")
     return running_l1 / n
 
 
@@ -160,6 +205,8 @@ def validate(model, loader, l1_fn, device):
         running_psnr += psnr
 
     n = len(loader)
+    if n == 0:
+        raise RuntimeError("[ERROR] val_loader 为空，无法验证。请检查 prepared_root / split / thickness 设置。")
     avg_l1 = running_l1 / n
     avg_psnr = running_psnr / n
     return avg_l1, avg_psnr
@@ -169,13 +216,31 @@ def check_paths():
     if not PREPARED_ROOT.exists():
         raise FileNotFoundError(f"[ERROR] PREPARED_ROOT 不存在: {PREPARED_ROOT}")
 
+    if not SPLIT_DIR.exists():
+        print(f"[WARN] SPLIT_DIR 不存在: {SPLIT_DIR}（当前训练脚本未直接使用 split 文件，可暂时忽略）")
+
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def create_scheduler(optimizer):
+    """
+    兼容旧版 PyTorch：不传 verbose
+    """
+    return ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=3,
+        min_lr=1e-6,
+    )
 
 
 def main():
     check_paths()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    output_activation = get_output_activation_name(USE_SIGMOID)
+
     print(f"[INFO] Using device: {device}")
     print(f"[INFO] PREPARED_ROOT = {PREPARED_ROOT}")
     print(f"[INFO] SAVE_DIR      = {SAVE_DIR}")
@@ -183,8 +248,10 @@ def main():
     print(f"[INFO] VAL_THICKNESS   = {VAL_THICKNESS}")
     print(f"[INFO] COND_THICKNESS  = {COND_THICKNESS}")
     print(f"[INFO] MODEL_IN_CHANNELS = {MODEL_IN_CHANNELS}")
+    print(f"[INFO] USE_SIGMOID = {USE_SIGMOID}")
+    print(f"[INFO] OUTPUT_ACTIVATION = {output_activation}")
 
-    summary_path = SAVE_DIR / "summary_seeds_trainall_valall.json"
+    summary_path = SAVE_DIR / f"summary_seeds_{TRAIN_THICKNESS}_{VAL_THICKNESS}.json"
     all_seed_results = []
 
     for seed in SEEDS:
@@ -218,7 +285,8 @@ def main():
                     "cond_thickness": COND_THICKNESS,
                     "model_in_channels": MODEL_IN_CHANNELS,
                     "loss": "L1",
-                    "output_activation": "none",
+                    "output_activation": output_activation,
+                    "use_sigmoid": USE_SIGMOID,
                     "seed": seed,
                     "deterministic": DETERMINISTIC,
                     "early_stop_patience": EARLY_STOP_PATIENCE,
@@ -246,6 +314,11 @@ def main():
             cond_thickness=COND_THICKNESS,
         )
 
+        if len(train_dataset) == 0:
+            raise RuntimeError("[ERROR] train_dataset 长度为 0，请检查数据目录结构。")
+        if len(val_dataset) == 0:
+            raise RuntimeError("[ERROR] val_dataset 长度为 0，请检查数据目录结构。")
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=BATCH_SIZE,
@@ -271,16 +344,8 @@ def main():
         l1_loss_fn = nn.L1Loss()
 
         optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
-
-        scheduler = ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=0.5,
-            patience=3,
-            verbose=True,
-            min_lr=1e-6,
-        )
+        scaler = create_grad_scaler(device)
+        scheduler = create_scheduler(optimizer)
 
         best_val_l1 = float("inf")
         best_val_psnr = -1.0
@@ -288,6 +353,7 @@ def main():
 
         history = []
         no_improve_epochs = 0
+        prev_lr = optimizer.param_groups[0]["lr"]
 
         for epoch in range(1, NUM_EPOCHS + 1):
             start_time = time.time()
@@ -303,6 +369,10 @@ def main():
 
             epoch_time = time.time() - start_time
             current_lr = optimizer.param_groups[0]["lr"]
+
+            if current_lr != prev_lr:
+                print(f"[INFO] LR changed: {prev_lr:.2e} -> {current_lr:.2e}")
+                prev_lr = current_lr
 
             print(
                 f"[Seed {seed}] [Epoch {epoch:03d}] "
@@ -349,7 +419,8 @@ def main():
                         "cond_thickness": COND_THICKNESS,
                         "model_in_channels": MODEL_IN_CHANNELS,
                         "exp_name": EXP_NAME,
-                        "output_activation": "none",
+                        "output_activation": output_activation,
+                        "use_sigmoid": USE_SIGMOID,
                     },
                     ckpt_path,
                 )
