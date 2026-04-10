@@ -54,7 +54,7 @@ EXP_ROOT = PATHS["exp_root"]
 
 # ================== 实验配置 ==================
 # !!! 并行实验时请务必保证 EXP_NAME 唯一 !!!
-EXP_NAME = "DS_C4_mixed_cond_th_sigmoid_l1only_trainall_valall"
+EXP_NAME = "DS_C4_mixed_cond_th_trainall_valall"
 SAVE_DIR = EXP_ROOT / EXP_NAME
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -80,7 +80,10 @@ COND_THICKNESS = True
 MODEL_IN_CHANNELS = 2 if COND_THICKNESS else 1
 
 DEEP_SUPERVISION = True
-SIGMOID_OUTPUT = True
+
+# 当前 DS 目录下的 UNet.__init__ 不接受 use_sigmoid 参数
+# 因此这里仅做实验记录，真实输出激活方式以 ldct_model.py 的实现为准
+SIGMOID_OUTPUT = "follow_model_impl"
 
 DS_WEIGHTS = {
     "main": 1.0,
@@ -400,7 +403,6 @@ def main():
             in_channels=MODEL_IN_CHANNELS,
             out_channels=1,
             base_ch=64,
-            use_sigmoid=SIGMOID_OUTPUT,
             deep_supervision=DEEP_SUPERVISION,
         ).to(device)
 
