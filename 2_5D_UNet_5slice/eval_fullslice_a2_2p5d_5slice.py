@@ -35,7 +35,7 @@ SAVE_ROOT = rf"E:\LDCT\eval_results\{EXP_NAME}_seed{SEED}"
 
 # ---- 评估设置 ----
 EVAL_SPLIT = "test"          # "train" | "val" | "test" | "external_test"
-EVAL_THICKNESS = "1mm"       # "1mm" | "3mm"
+EVAL_THICKNESS = "3mm"       # "1mm" | "3mm"
 PATCH_SIZE = 256
 
 # ---- 与训练对应的 thickness 信息（仅用于记录）----

@@ -18,8 +18,8 @@ from ldct_model import UNet
 # 0. 配置区（你只改这里）
 # =========================
 
-# ---- 实验命名（与训练保持一致）----
-EXP_NAME = "baseline_1mm_only_2p5d_5slice_sigmoid_l1"
+# ---- 实验命名（和 train 保持一致）----
+EXP_NAME = "DS_C4_mixed_cond_th_2p5d_5slice_residual_nosig_l1_trainall_valall"
 SEED = 0
 
 # ---- 数据路径 ----
@@ -28,37 +28,39 @@ TEST_QD_ROOT = r"E:\LDCT\Testing_Image_Data\1mm B30\QD_1mm"
 SPLIT_JSON = r"E:\LDCT\splits\patient_splits.json"
 
 # ---- 模型路径 ----
-CKPT_PATH = rf"E:\LDCT\experiments\{EXP_NAME}\best_unet.pth"
+CKPT_PATH = rf"E:\LDCT\experiments\{EXP_NAME}\seed_{SEED}\best_{EXP_NAME}_seed{SEED}.pth"
 
 # ---- 输出目录 ----
-SAVE_ROOT = rf"E:\LDCT\eval_results\{EXP_NAME}"
+SAVE_ROOT = rf"E:\LDCT\eval_results\{EXP_NAME}_seed{SEED}"
 
 # ---- 评估设置 ----
 EVAL_SPLIT = "test"          # "train" | "val" | "test" | "external_test"
-EVAL_THICKNESS = "1mm"       # 这版训练是 1mm-only，建议评估 1mm
+EVAL_THICKNESS = "3mm"       # "1mm" | "3mm"
 PATCH_SIZE = 256
 
-# ---- 与训练对应的信息（仅用于记录）----
-TRAIN_THICKNESS = "1mm"
-VAL_THICKNESS = "1mm"
-INPUT_MODE = "2.5D_5slice"
-MODEL_IN_CHANNELS = 5
+# ---- 与训练对应的 thickness 信息（仅用于记录）----
+TRAIN_THICKNESS = "all"
+VAL_THICKNESS = "all"
+COND_THICKNESS = True
 
 # ---- 2.5D 设置 ----
-NUM_INPUT_SLICES = 5
-SLICE_OFFSET = NUM_INPUT_SLICES // 2   # 5 -> 2
-BOUNDARY_MODE = "replicate"            # replicate | drop
+NUM_SLICES = 5
+HALF_SPAN = NUM_SLICES // 2   # 2
+
+# ---- thickness 映射 ----
+THICKNESS_TO_ID = {
+    "1mm": 0,
+    "3mm": 1,
+}
 
 # ---- 归一化窗口（必须和训练保持一致）----
 CLIP_MIN = -160.0
 CLIP_MAX = 240.0
 
 # ---- 指标空间 ----
-# "norm"：在 [0,1] 归一化空间算
-# "hu"  ：先反归一化回 HU 再算 RMSE/MAE/NRMSE/HFEN；PSNR/SSIM 仍在 norm 空间
 METRIC_SPACE = "hu"
 
-# ---- sigmoid 输出，理论上已在 [0,1]，这里只做保险 clip ----
+# ---- 预测后处理 ----
 CLIP_PRED_BEFORE_METRIC = True
 SAVE_RAW_PRED = True
 
@@ -71,7 +73,6 @@ AUTO_ROI_BY_ERROR = True
 
 # ---- 设备 ----
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 
 FD_ROOTS = {
     "1mm": os.path.join(TRAIN_DATA_ROOT, "full_1mm"),
@@ -230,60 +231,57 @@ def match_fd_qd_pairs(fd_series: List, qd_series: List) -> List[Tuple]:
 
 
 # =========================
-# 2. 2.5D stack 构造
+# 2. 2.5D 输入构造
 # =========================
 
-def get_neighbor_indices(center_idx: int, num_slices: int, radius: int, mode: str = "replicate") -> List[int]:
-    idxs = []
-    for offset in range(-radius, radius + 1):
-        idx = center_idx + offset
-        if mode == "replicate":
-            idx = min(max(idx, 0), num_slices - 1)
-            idxs.append(idx)
-        elif mode == "drop":
-            if idx < 0 or idx >= num_slices:
-                return []
-            idxs.append(idx)
-        else:
-            raise ValueError("mode must be 'replicate' or 'drop'")
-    return idxs
+def get_padded_index(idx: int, n: int) -> int:
+    if idx < 0:
+        return 0
+    if idx >= n:
+        return n - 1
+    return idx
 
 
-def build_2p5d_stack_from_qd_series(
+def build_2p5d_stack_from_qd_slices(
     qd_norm_slices: List[np.ndarray],
     center_idx: int,
-    num_input_slices: int = 5,
-    mode: str = "replicate",
+    thickness_id: int,
+    cond_thickness: bool = True,
 ) -> np.ndarray:
-    radius = num_input_slices // 2
-    idxs = get_neighbor_indices(center_idx, len(qd_norm_slices), radius, mode=mode)
-    if len(idxs) != num_input_slices:
-        raise ValueError(
-            f"[ERROR] 无法构造 {num_input_slices}-slice stack, center_idx={center_idx}, idxs={idxs}"
-        )
-    stack = np.stack([qd_norm_slices[i] for i in idxs], axis=0).astype(np.float32)  # (C,H,W)
-    return stack
+    """
+    返回 shape:
+      - 无 thickness: (5, H, W)
+      - 有 thickness: (6, H, W)
+    """
+    n = len(qd_norm_slices)
+    neighbors = []
+
+    for offset in range(-HALF_SPAN, HALF_SPAN + 1):
+        j = get_padded_index(center_idx + offset, n)
+        neighbors.append(qd_norm_slices[j])
+
+    x = np.stack(neighbors, axis=0).astype(np.float32)  # (5, H, W)
+
+    if cond_thickness:
+        h, w = x.shape[1], x.shape[2]
+        th_map = np.full((1, h, w), float(thickness_id), dtype=np.float32)
+        x = np.concatenate([x, th_map], axis=0)         # (6, H, W)
+
+    return x
 
 
 # =========================
-# 3. Patch 切分 / 回拼（支持 2.5D）
+# 3. Patch 切分 / 回拼
 # =========================
 
-def image_to_patches_2p5d(img_2p5d: np.ndarray, patch_size: int):
-    """
-    img_2p5d: (C, H, W)
-    return:
-      patches: (N, C, patch_size, patch_size)
-      coords : [(y, x), ...]
-      hw     : (H, W)
-    """
-    c, h, w = img_2p5d.shape
+def image_to_patches_multichannel(img_chw: np.ndarray, patch_size: int):
+    c, h, w = img_chw.shape
     patches = []
     coords = []
 
     for y in range(0, h, patch_size):
         for x in range(0, w, patch_size):
-            p = img_2p5d[:, y:y + patch_size, x:x + patch_size]
+            p = img_chw[:, y:y + patch_size, x:x + patch_size]
             if p.shape == (c, patch_size, patch_size):
                 patches.append(p)
                 coords.append((y, x))
@@ -293,9 +291,6 @@ def image_to_patches_2p5d(img_2p5d: np.ndarray, patch_size: int):
 
 
 def stitch_patches(patches: np.ndarray, coords: List[Tuple[int, int]], out_hw: Tuple[int, int], patch_size: int):
-    """
-    patches: (N, patch_size, patch_size)
-    """
     h, w = out_hw
     out = np.zeros((h, w), dtype=np.float32)
     count = np.zeros((h, w), dtype=np.float32)
@@ -310,21 +305,27 @@ def stitch_patches(patches: np.ndarray, coords: List[Tuple[int, int]], out_hw: T
 
 
 @torch.no_grad()
-def predict_full_slice_raw_2p5d(
+def predict_full_slice_raw_2p5d_ds(
     model: nn.Module,
-    qd_stack_norm: np.ndarray,   # (5,H,W)
+    input_chw: np.ndarray,      # (C,H,W)
     patch_size: int,
     device: str,
-    batch_size: int = 8,
+    batch_size: int = 8
 ):
-    patches, coords, out_hw = image_to_patches_2p5d(qd_stack_norm, patch_size)
+    patches, coords, out_hw = image_to_patches_multichannel(input_chw, patch_size)
     preds = []
 
     for i in range(0, len(patches), batch_size):
-        batch = patches[i:i + batch_size]                     # (N,C,H,W)
+        batch = patches[i:i + batch_size]  # (N,C,H,W)
         batch_t = torch.from_numpy(batch).to(device)
-        out = model(batch_t)                                  # (N,1,H,W)
-        out = out.squeeze(1).cpu().numpy().astype(np.float32) # (N,H,W)
+        outs = model(batch_t)
+
+        if isinstance(outs, (list, tuple)):
+            out = outs[0]   # DS 主输出
+        else:
+            out = outs
+
+        out = out.squeeze(1).cpu().numpy().astype(np.float32)
         preds.append(out)
 
     preds = np.concatenate(preds, axis=0)
@@ -343,10 +344,6 @@ def postprocess_prediction_for_metric(pred_norm_raw: np.ndarray) -> np.ndarray:
 # =========================
 
 class SSIMMetric(nn.Module):
-    """
-    返回 SSIM 值（不是 loss）
-    输入: [N,1,H,W]，范围默认 [0,1]
-    """
     def __init__(self, window_size=11):
         super().__init__()
         self.window_size = window_size
@@ -418,7 +415,7 @@ def compute_rmse(pred: np.ndarray, gt: np.ndarray) -> float:
 def compute_nrmse(pred: np.ndarray, gt: np.ndarray, mode: str = "range") -> float:
     rmse = compute_rmse(pred, gt)
     if mode == "range":
-        denom = float(CLIP_MAX - CLIP_MIN)
+        denom = float(gt.max() - gt.min())
     elif mode == "mean":
         denom = float(np.mean(np.abs(gt)))
     else:
@@ -596,13 +593,15 @@ def save_visualization(
 
 
 # =========================
-# 6. external_test 纯推理导出
+# 6. external_test
 # =========================
 
 @torch.no_grad()
-def run_external_test(model: nn.Module, patient_ids: List[str], device: str):
+def run_external_test(model: nn.Module, patient_ids: List[str], device: str, model_in_channels: int):
     out_dir = Path(SAVE_ROOT) / "external_test" / "pred_npy"
     ensure_dir(out_dir)
+
+    thickness_id = THICKNESS_TO_ID["1mm"]
 
     for patient_id in tqdm(patient_ids, desc="External inference", ncols=120):
         qd_dir = Path(TEST_QD_ROOT) / patient_id / "quarter_1mm"
@@ -611,32 +610,37 @@ def run_external_test(model: nn.Module, patient_ids: List[str], device: str):
             print(f"❌ external {patient_id}: 空")
             continue
 
-        qd_norm_slices = []
-        qd_hu_center_slices = []
+        qd_crop_hu_list = []
+        qd_norm_list = []
         for ds in qd_series:
             qd_hu = dicom_to_hu(ds)
             qd_crop_hu, _ = center_crop_to_multiple(qd_hu, PATCH_SIZE)
             qd_norm = hu_to_norm(qd_crop_hu)
-            qd_hu_center_slices.append(qd_crop_hu)
-            qd_norm_slices.append(qd_norm)
+            qd_crop_hu_list.append(qd_crop_hu)
+            qd_norm_list.append(qd_norm)
 
         patient_out = out_dir / patient_id
         ensure_dir(patient_out)
 
-        valid_indices = range(len(qd_norm_slices))
-        if BOUNDARY_MODE == "drop":
-            valid_indices = range(SLICE_OFFSET, len(qd_norm_slices) - SLICE_OFFSET)
-
-        for i in valid_indices:
-            qd_stack_norm = build_2p5d_stack_from_qd_series(
-                qd_norm_slices,
+        for i in range(len(qd_norm_list)):
+            input_chw = build_2p5d_stack_from_qd_slices(
+                qd_norm_slices=qd_norm_list,
                 center_idx=i,
-                num_input_slices=NUM_INPUT_SLICES,
-                mode=BOUNDARY_MODE,
+                thickness_id=thickness_id,
+                cond_thickness=COND_THICKNESS,
             )
 
-            pred_norm_raw = predict_full_slice_raw_2p5d(
-                model, qd_stack_norm, PATCH_SIZE, device, batch_size=8
+            if input_chw.shape[0] != model_in_channels:
+                raise RuntimeError(
+                    f"[ERROR] 输入通道数不匹配: built={input_chw.shape[0]}, model_in_channels={model_in_channels}"
+                )
+
+            pred_norm_raw = predict_full_slice_raw_2p5d_ds(
+                model=model,
+                input_chw=input_chw,
+                patch_size=PATCH_SIZE,
+                device=device,
+                batch_size=8,
             )
             pred_norm_eval = postprocess_prediction_for_metric(pred_norm_raw)
             pred_hu_eval = norm_to_hu(pred_norm_eval)
@@ -651,21 +655,38 @@ def run_external_test(model: nn.Module, patient_ids: List[str], device: str):
 
 
 # =========================
-# 7. 主评估流程
+# 7. 主流程
 # =========================
 
 def build_model_and_load_ckpt(ckpt_path: str, device: str):
-    model = UNet(in_channels=MODEL_IN_CHANNELS, out_channels=1, base_ch=64).to(device)
     ckpt = torch.load(ckpt_path, map_location=device)
 
-    if "model_state" in ckpt:
+    if isinstance(ckpt, dict):
+        model_in_channels = int(ckpt.get("model_in_channels", 6))
+        deep_supervision = bool(ckpt.get("deep_supervision", True))
+    else:
+        model_in_channels = 6
+        deep_supervision = True
+
+    model = UNet(
+        in_channels=model_in_channels,
+        out_channels=1,
+        base_ch=64,
+        use_sigmoid=False,
+        deep_supervision=deep_supervision,
+    ).to(device)
+
+    if isinstance(ckpt, dict) and "model_state" in ckpt:
         model.load_state_dict(ckpt["model_state"])
     else:
         model.load_state_dict(ckpt)
 
     model.eval()
     print(f"[INFO] Checkpoint loaded from: {ckpt_path}")
-    return model
+    print(f"[INFO] model_in_channels={model_in_channels}")
+    print(f"[INFO] deep_supervision={deep_supervision}")
+    print(f"[INFO] input_mode=2.5D_5slice_cond_th, use_sigmoid=False, residual_learning=True")
+    return model, model_in_channels, deep_supervision
 
 
 def summarize_metrics(records: List[dict]):
@@ -685,14 +706,14 @@ def summarize_metrics(records: List[dict]):
 def main():
     ensure_dir(Path(SAVE_ROOT))
 
-    model = build_model_and_load_ckpt(CKPT_PATH, DEVICE)
+    model, model_in_channels, deep_supervision = build_model_and_load_ckpt(CKPT_PATH, DEVICE)
     ssim_metric = SSIMMetric(window_size=11).to(DEVICE)
 
     splits = load_splits(SPLIT_JSON)
     patient_ids = splits.get(EVAL_SPLIT, [])
 
     if EVAL_SPLIT == "external_test":
-        run_external_test(model, patient_ids, DEVICE)
+        run_external_test(model, patient_ids, DEVICE, model_in_channels)
         return
 
     assert EVAL_SPLIT in ["train", "val", "test"]
@@ -705,6 +726,8 @@ def main():
 
     all_slice_records = []
     patient_level_records = []
+
+    thickness_id = THICKNESS_TO_ID[EVAL_THICKNESS]
 
     for patient_id in tqdm(patient_ids, desc=f"Evaluating {EVAL_SPLIT}-{EVAL_THICKNESS}", ncols=120):
         fd_dir = Path(FD_ROOTS[EVAL_THICKNESS]) / patient_id / f"full_{EVAL_THICKNESS}"
@@ -722,10 +745,10 @@ def main():
             print(f"❌ {patient_id} {EVAL_THICKNESS}: 无法配对切片，跳过")
             continue
 
-        fd_norm_slices = []
-        fd_hu_slices = []
-        qd_norm_slices = []
-        qd_hu_slices = []
+        fd_crop_hu_list = []
+        fd_norm_list = []
+        qd_crop_hu_list = []
+        qd_norm_list = []
 
         for fd_ds, qd_ds in pairs:
             fd_hu = dicom_to_hu(fd_ds)
@@ -737,45 +760,45 @@ def main():
             fd_norm = hu_to_norm(fd_crop_hu)
             qd_norm = hu_to_norm(qd_crop_hu)
 
-            fd_hu_slices.append(fd_crop_hu)
-            qd_hu_slices.append(qd_crop_hu)
-            fd_norm_slices.append(fd_norm)
-            qd_norm_slices.append(qd_norm)
-
-        if BOUNDARY_MODE == "drop":
-            valid_indices = range(SLICE_OFFSET, len(qd_norm_slices) - SLICE_OFFSET)
-        else:
-            valid_indices = range(len(qd_norm_slices))
+            fd_crop_hu_list.append(fd_crop_hu)
+            fd_norm_list.append(fd_norm)
+            qd_crop_hu_list.append(qd_crop_hu)
+            qd_norm_list.append(qd_norm)
 
         patient_slice_records = []
         vis_saved = 0
 
-        for i in valid_indices:
-            fd_norm = fd_norm_slices[i]
-            fd_crop_hu = fd_hu_slices[i]
-            qd_crop_hu = qd_hu_slices[i]
-
-            qd_stack_norm = build_2p5d_stack_from_qd_series(
-                qd_norm_slices,
+        for i in range(len(pairs)):
+            input_chw = build_2p5d_stack_from_qd_slices(
+                qd_norm_slices=qd_norm_list,
                 center_idx=i,
-                num_input_slices=NUM_INPUT_SLICES,
-                mode=BOUNDARY_MODE,
+                thickness_id=thickness_id,
+                cond_thickness=COND_THICKNESS,
             )
 
-            pred_norm_raw = predict_full_slice_raw_2p5d(
-                model, qd_stack_norm, PATCH_SIZE, DEVICE, batch_size=8
+            if input_chw.shape[0] != model_in_channels:
+                raise RuntimeError(
+                    f"[ERROR] 输入通道数不匹配: built={input_chw.shape[0]}, model_in_channels={model_in_channels}"
+                )
+
+            pred_norm_raw = predict_full_slice_raw_2p5d_ds(
+                model=model,
+                input_chw=input_chw,
+                patch_size=PATCH_SIZE,
+                device=DEVICE,
+                batch_size=8,
             )
             pred_norm_eval = postprocess_prediction_for_metric(pred_norm_raw)
 
-            metrics = evaluate_pair(pred_norm_eval, fd_norm, ssim_metric, METRIC_SPACE, DEVICE)
+            metrics = evaluate_pair(pred_norm_eval, fd_norm_list[i], ssim_metric, METRIC_SPACE, DEVICE)
 
             slice_record = {
                 "patient_id": patient_id,
                 "slice_idx": i,
                 "thickness": EVAL_THICKNESS,
-                "input_mode": INPUT_MODE,
-                "num_input_slices": NUM_INPUT_SLICES,
-                "boundary_mode": BOUNDARY_MODE,
+                "thickness_id": int(thickness_id),
+                "num_input_slices": NUM_SLICES,
+                "deep_supervision": deep_supervision,
                 "pred_min_raw": float(np.min(pred_norm_raw)),
                 "pred_max_raw": float(np.max(pred_norm_raw)),
                 "pred_min_eval": float(np.min(pred_norm_eval)),
@@ -790,8 +813,8 @@ def main():
                 save_path = vis_dir / f"{patient_id}_s{i:03d}.png"
                 save_visualization(
                     save_path=save_path,
-                    qd_hu=qd_crop_hu,   # 可视化显示中心 slice
-                    gt_hu=fd_crop_hu,
+                    qd_hu=qd_crop_hu_list[i],   # 中心 slice
+                    gt_hu=fd_crop_hu_list[i],
                     pred_hu=pred_hu_eval,
                     patient_id=patient_id,
                     slice_idx=i,
@@ -820,27 +843,34 @@ def main():
     summary = {
         "exp_name": EXP_NAME,
         "seed": SEED,
+        "checkpoint_path": CKPT_PATH,
         "eval_split": EVAL_SPLIT,
         "eval_thickness": EVAL_THICKNESS,
         "train_thickness": TRAIN_THICKNESS,
         "val_thickness": VAL_THICKNESS,
+        "cond_thickness": COND_THICKNESS,
+        "num_input_slices": NUM_SLICES,
+        "model_in_channels": model_in_channels,
+        "deep_supervision": deep_supervision,
         "metric_space_for_MAE_RMSE_NRMSE_HFEN": METRIC_SPACE,
+        "clip_min": CLIP_MIN,
+        "clip_max": CLIP_MAX,
+        "patch_size": PATCH_SIZE,
+        "clip_pred_before_metric": CLIP_PRED_BEFORE_METRIC,
+        "loss": "L1",
+        "input_mode": "2.5D_5slice_cond_th",
+        "model_output_activation": "none",
+        "use_residual": True,
+        "model_prediction_type": "main_output_linear_residual_2p5d_5slice_ds",
+        "thickness_mapping": {
+            "1mm": 0,
+            "3mm": 1,
+        },
         "num_patients": len(patient_level_records),
         "num_slices": len(all_slice_records),
         "slice_level_summary": summarize_metrics(all_slice_records),
         "patient_level_summary": summarize_metrics(patient_level_records),
-        "ckpt_path": CKPT_PATH,
-        "clip_min": CLIP_MIN,
-        "clip_max": CLIP_MAX,
-        "patch_size": PATCH_SIZE,
-        "loss": "L1",
-        "model_output_activation": "sigmoid",
-        "clip_pred_before_metric": CLIP_PRED_BEFORE_METRIC,
         "save_raw_pred": SAVE_RAW_PRED,
-        "input_mode": INPUT_MODE,
-        "model_in_channels": MODEL_IN_CHANNELS,
-        "num_input_slices": NUM_INPUT_SLICES,
-        "boundary_mode": BOUNDARY_MODE,
     }
 
     summary_json = result_dir / f"summary_{EXP_NAME}_seed{SEED}.json"
@@ -852,19 +882,10 @@ def main():
     print(f"[INFO] exp_name={EXP_NAME}")
     print(f"[INFO] split={EVAL_SPLIT}, thickness={EVAL_THICKNESS}")
     print(f"[INFO] train_thickness={TRAIN_THICKNESS}, val_thickness={VAL_THICKNESS}")
-    print(f"[INFO] input_mode={INPUT_MODE}, in_channels={MODEL_IN_CHANNELS}")
+    print(f"[INFO] cond_thickness={COND_THICKNESS}, model_in_channels={model_in_channels}")
+    print(f"[INFO] num_input_slices={NUM_SLICES}, deep_supervision={deep_supervision}")
     print(f"[INFO] slices={summary['num_slices']}, patients={summary['num_patients']}")
     print(f"[INFO] summary saved to: {summary_json}")
-
-    s = summary["slice_level_summary"]
-    print(
-        f"[SLICE] PSNR={s['PSNR']['mean']:.4f}±{s['PSNR']['std']:.4f} | "
-        f"SSIM={s['SSIM']['mean']:.6f}±{s['SSIM']['std']:.6f} | "
-        f"MAE={s['MAE']['mean']:.4f}±{s['MAE']['std']:.4f} | "
-        f"RMSE={s['RMSE']['mean']:.4f}±{s['RMSE']['std']:.4f} | "
-        f"NRMSE={s['NRMSE']['mean']:.6f}±{s['NRMSE']['std']:.6f} | "
-        f"HFEN={s['HFEN']['mean']:.6f}±{s['HFEN']['std']:.6f}"
-    )
     print("=" * 100)
 
 
